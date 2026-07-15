@@ -16,7 +16,6 @@ substructure-level representations through a three-stage training strategy.
 - `Data/`: graph construction, featurization, staged model code, and training utilities.
 - `Utils/`: evaluation metrics.
 - `train.py`: training entry point.
-- `binding_site_validation/`: binding-site attribution and validation scripts.
 
 Large datasets, graph caches, trained checkpoints, logs, virtual environments,
 and local server artifacts are intentionally excluded from this open-source
