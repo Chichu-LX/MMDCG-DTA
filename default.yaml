@@ -1,0 +1,29 @@
+# default.yaml
+
+# ==============
+# Training Hyperparameters
+# ==============
+batch_size: 64          # 批次大小
+learning_rate: 0.003    # 学习率
+max_epochs: 200         # 训练最多进行 200 个 epoch
+patience: 50            # Early Stopping 策略中，当测试集 RMSE 连续 50 个 epoch 无提升则停止
+
+# ==============
+# Model Hyperparameters
+# ==============
+d_atom: 8               # 原子交互时的距离阈值 (Å)
+d_res: 8                # 残基交互时的距离阈值 (Å)
+d_sub: 6                # 子结构交互时的距离阈值 (Å)
+
+l_intra: 3              # Intra-type 编码器迭代次数
+l_inter: 3              # Inter-type 编码器迭代次数
+l_atom: 2               # Atom-level Interactive Learning 迭代次数
+l_sub: 2                # Substructure-level Interactive Learning 迭代次数
+
+embedding_dim: 128      # 特征表示维度 d
+
+# ==============
+# Additional Hyperparameters
+# ==============
+inter_negative_slope: 0.2  # LeakyReLU 的负斜率（常用默认值）
+sub_x_dim: 16              # 子结构初始物理化学描述符维度

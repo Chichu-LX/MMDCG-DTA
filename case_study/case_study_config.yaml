@@ -1,0 +1,48 @@
+# Case Study: HIV-1 Protease Binding Affinity Prediction
+# MMDCG-DTA: Molecular Mechanics-Informed Dynamic Contact Graph
+# Target: HIV-1 Protease (~50 complexes from PDBbind v2016)
+
+# ==============
+# Case Study Configuration
+# ==============
+target_name: "HIV-1 Protease"
+target_description: "HIV-1 protease is a retroviral aspartyl protease essential for the life-cycle of HIV. It cleaves newly synthesized polyproteins at specific sites to create mature protein components of an infectious HIV virion."
+
+# ==============
+# Training Hyperparameters
+# ==============
+batch_size: 1
+learning_rate: 0.0001
+max_epochs: 200
+patience: 50
+
+# ==============
+# Model Hyperparameters (matching pretrained checkpoint: stage1_model_best.pth)
+# ==============
+d_atom: 4.0
+d_res: 8.0
+d_sub: 8.0
+l_intra: 2
+l_inter: 2
+l_atom: 2
+l_sub: 2
+embedding_dim: 64
+inter_negative_slope: 0.2
+sub_x_dim: 5
+raw_atom_dim: 5
+prot_res_dim: 1
+use_checkpoint: false
+
+# ==============
+# Data Split
+# ==============
+val_ratio: 0.15
+test_ratio: 0.15
+
+# ==============
+# Interpretability Settings
+# ==============
+save_attention_weights: true
+save_bridge_node_states: true
+save_interaction_maps: true
+save_reconstructed_graphs: true

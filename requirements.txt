@@ -1,0 +1,7 @@
+dgl==1.0.2+cu116
+torch==1.13.1+cu116
+rdkit==2022.9.5
+ProDy==2.4.0
+torchani==2.2
+PyYAML==6.0
+numpy==1.23.5

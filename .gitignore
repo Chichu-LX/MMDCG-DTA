@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+dhil_env/
+source/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+
+# Data, model checkpoints, generated artifacts
+Data/PDBbind_dataset/
+Data/Log/
+Data/Model/
+*.pkl
+*.pth
+*.pt
+*.ckpt
+*.log
+nohup.out
+pipeline_output.log
+pipeline_run.log
+
+# Runtime outputs
+Log/
+figures/
+results/
+case_study/hiv_protease_*
+binding_site_validation/figures/
+binding_site_validation/results/

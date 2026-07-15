@@ -1,0 +1,40 @@
+# default.yaml
+
+# ==============
+# Training Hyperparameters
+# ==============
+batch_size: 1           # 修正：MMDCG-DTA模型是单样本图网络，Batch必须为1 (代码逻辑已强制处理，此处保持一致即可)
+learning_rate: 0.001    # 建议稍微调低初始学习率，配合 Scheduler
+max_epochs: 200         
+patience: 30            
+
+# ==============
+# Model Hyperparameters
+# ==============
+d_atom: 8               
+d_res: 8                
+d_sub: 6                
+
+l_intra: 3              
+l_inter: 3              
+l_atom: 2               
+l_sub: 2                
+
+embedding_dim: 128      
+
+# ==============
+# Additional Hyperparameters (关键修正部分)
+# ==============
+inter_negative_slope: 0.2  
+
+# [关键修正] featurize.py 实际生成的维度是 5，不是 16
+sub_x_dim: 5              
+
+# [新增显式配置] 确保与 featurize.py 的 featurize_atom 输出一致 (5维)
+raw_atom_dim: 5
+
+# [新增显式配置] 确保与 featurize.py 的 featurize_substructure(protein) 输出一致 (1维)
+prot_res_dim: 1
+
+weight_decay: 0.00001
+dropout_rate: 0.1
