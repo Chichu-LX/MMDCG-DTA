@@ -15,9 +15,7 @@ substructure-level representations through a three-stage training strategy.
 - `Data/MMDCG_DTA_Stage3.py`: final affinity-prediction fine-tuning.
 - `Data/`: graph construction, featurization, staged model code, and training utilities.
 - `Utils/`: evaluation metrics.
-- `train.py`, `train_new.py`: training entry points.
-- `case_study/`: HIV-1 protease case study scripts.
-- `virtual_screening/`: virtual screening utilities.
+- `train.py`: training entry point.
 - `binding_site_validation/`: binding-site attribution and validation scripts.
 
 Large datasets, graph caches, trained checkpoints, logs, virtual environments,
@@ -66,12 +64,6 @@ python train.py
 ```
 
 Training configuration is stored in `default.yaml`.
-
-## Case Study and Virtual Screening
-
-Case-study scripts are in `case_study/`, and virtual screening scripts are in
-`virtual_screening/`. Some scripts expect generated graph caches or pretrained
-checkpoints to exist locally before running.
 
 ## License
 
