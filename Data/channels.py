@@ -1,271 +1,229 @@
+"""Physics-gated intra- and intermolecular graph-attention channels."""
+
+from __future__ import annotations
+
+import dgl.function as fn
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import dgl
-import dgl.function as fn
 from dgl.nn.functional import edge_softmax
-from mechanics import InteractionForceMLP 
 
-# =============================================================================
-# 1. GAT Layer (修改：支持 edge_weights)
-# =============================================================================
+from .mechanics import InteractionForceMLP
+
+
+def _as_counts(values) -> list[int]:
+    if torch.is_tensor(values):
+        return [int(value) for value in values.detach().cpu().tolist()]
+    return [int(value) for value in values]
+
+
+def pack_bipartite_features(h_ligand, h_protein, ligand_counts, protein_counts):
+    """Match DGL's per-sample ``[ligand, protein]`` interaction-node order."""
+    ligand_counts = _as_counts(ligand_counts)
+    protein_counts = _as_counts(protein_counts)
+    ligand_chunks = torch.split(h_ligand, ligand_counts)
+    protein_chunks = torch.split(h_protein, protein_counts)
+    return torch.cat(
+        [part for pair in zip(ligand_chunks, protein_chunks) for part in pair], dim=0
+    )
+
+
+def unpack_bipartite_features(h_all, ligand_counts, protein_counts):
+    ligand_counts = _as_counts(ligand_counts)
+    protein_counts = _as_counts(protein_counts)
+    ligand_parts = []
+    protein_parts = []
+    offset = 0
+    for n_ligand, n_protein in zip(ligand_counts, protein_counts):
+        ligand_parts.append(h_all[offset : offset + n_ligand])
+        offset += n_ligand
+        protein_parts.append(h_all[offset : offset + n_protein])
+        offset += n_protein
+    return torch.cat(ligand_parts, dim=0), torch.cat(protein_parts, dim=0)
+
+
 class GATLayer(nn.Module):
     def __init__(self, in_dim, out_dim, edge_dim=0, negative_slope=0.2):
-        super(GATLayer, self).__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.edge_dim = edge_dim
-        
-        self.W = nn.Linear(in_dim, out_dim, bias=False) 
-        
-        if edge_dim > 0:
-            self.W_e = nn.Linear(edge_dim, out_dim, bias=False)
-            self.attn_dim = 3 * out_dim
-        else:
-            self.W_e = None
-            self.attn_dim = 2 * out_dim
-
-        self.attn_l = nn.Parameter(torch.FloatTensor(1, out_dim))
-        self.attn_r = nn.Parameter(torch.FloatTensor(1, out_dim))
-        if edge_dim > 0:
-            self.attn_e = nn.Parameter(torch.FloatTensor(1, out_dim))
-
-        self.bias = nn.Parameter(torch.FloatTensor(out_dim))
-        self.leakyrelu = nn.LeakyReLU(negative_slope)
+        super().__init__()
+        self.node_projection = nn.Linear(in_dim, out_dim, bias=False)
+        self.edge_projection = (
+            nn.Linear(edge_dim, out_dim, bias=False) if edge_dim else None
+        )
+        self.attn_src = nn.Parameter(torch.empty(1, out_dim))
+        self.attn_dst = nn.Parameter(torch.empty(1, out_dim))
+        self.attn_edge = nn.Parameter(torch.empty(1, out_dim)) if edge_dim else None
+        self.bias = nn.Parameter(torch.zeros(out_dim))
+        self.activation = nn.LeakyReLU(negative_slope)
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.xavier_normal_(self.W.weight)
-        if self.W_e is not None:
-            nn.init.xavier_normal_(self.W_e.weight)
-            nn.init.xavier_normal_(self.attn_e)
-        nn.init.xavier_normal_(self.attn_l)
-        nn.init.xavier_normal_(self.attn_r)
-        nn.init.zeros_(self.bias)
+        nn.init.xavier_normal_(self.node_projection.weight)
+        if self.edge_projection is not None:
+            nn.init.xavier_normal_(self.edge_projection.weight)
+            nn.init.xavier_normal_(self.attn_edge)
+        nn.init.xavier_normal_(self.attn_src)
+        nn.init.xavier_normal_(self.attn_dst)
 
-    def forward(self, g, h, edge_feats=None, edge_weights=None):
-        """
-        [修改] 增加 edge_weights 参数，用于接收内部分子力学权重
-        """
-        feat = self.W(h)
-        el = (feat * self.attn_l).sum(dim=-1).unsqueeze(-1)
-        er = (feat * self.attn_r).sum(dim=-1).unsqueeze(-1)
-        
-        g.ndata.update({'ft': feat, 'el': el, 'er': er})
-        
-        if self.edge_dim > 0 and edge_feats is not None:
-            feat_e = self.W_e(edge_feats)
-            ee = (feat_e * self.attn_e).sum(dim=-1).unsqueeze(-1)
-            g.edata['ee'] = ee
-            g.apply_edges(fn.u_add_v('el', 'er', 'e'))
-            e = self.leakyrelu(g.edata.pop('e') + g.edata.pop('ee'))
-        else:
-            g.apply_edges(fn.u_add_v('el', 'er', 'e'))
-            e = self.leakyrelu(g.edata.pop('e'))
-            
-        g.edata['a'] = edge_softmax(g, e)
-        
-        # [关键修改] 如果传入了物理权重 (Bond Energy)，则对 Attention 进行加权
-        if edge_weights is not None:
-            g.edata['a'] = g.edata['a'] * edge_weights
-            
-        g.update_all(fn.u_mul_e('ft', 'a', 'm'), fn.sum('m', 'ft'))
-        
-        rst = g.ndata.pop('ft') + self.bias
-        g.ndata.pop('el')
-        g.ndata.pop('er')
-        return self.leakyrelu(rst)
+    def forward(self, graph, node_features, edge_features=None, edge_weights=None):
+        with graph.local_scope():
+            projected = self.node_projection(node_features)
+            if graph.num_edges() == 0:
+                return self.activation(torch.zeros_like(projected) + self.bias)
+            graph.ndata["projected"] = projected
+            graph.ndata["score_src"] = (projected * self.attn_src).sum(-1, keepdim=True)
+            graph.ndata["score_dst"] = (projected * self.attn_dst).sum(-1, keepdim=True)
+            graph.apply_edges(fn.u_add_v("score_src", "score_dst", "score"))
+            score = graph.edata["score"]
+            if self.edge_projection is not None:
+                if edge_features is None:
+                    raise ValueError("edge features are required by this GAT layer")
+                projected_edge = self.edge_projection(edge_features)
+                score = score + (projected_edge * self.attn_edge).sum(-1, keepdim=True)
+            attention = edge_softmax(graph, self.activation(score))
+            if edge_weights is not None:
+                attention = attention * edge_weights.reshape(-1, 1)
+            graph.edata["attention"] = attention
+            graph.update_all(
+                fn.u_mul_e("projected", "attention", "message"),
+                fn.sum("message", "updated"),
+            )
+            return self.activation(graph.ndata["updated"] + self.bias)
 
 
 class IntraChannel(nn.Module):
     def __init__(self, num_layers, in_dim, hidden_dim, negative_slope=0.2, edge_dim=0):
-        super(IntraChannel, self).__init__()
-        self.layers = nn.ModuleList()
-        self.layers.append(GATLayer(in_dim, hidden_dim, edge_dim, negative_slope))
-        for _ in range(num_layers - 1):
-            self.layers.append(GATLayer(hidden_dim, hidden_dim, edge_dim, negative_slope))
+        super().__init__()
+        dimensions = [in_dim] + [hidden_dim] * num_layers
+        self.layers = nn.ModuleList(
+            GATLayer(dimensions[i], dimensions[i + 1], edge_dim, negative_slope)
+            for i in range(num_layers)
+        )
 
-    def forward(self, g, h, edge_feats=None, edge_weights=None):
-        # 将权重传递给每一层 GAT
+    def forward(self, graph, node_features, edge_features=None, edge_weights=None):
+        hidden = node_features
         for layer in self.layers:
-            h = layer(g, h, edge_feats, edge_weights)
-        return h
+            hidden = layer(graph, hidden, edge_features, edge_weights)
+        return hidden
 
 
-# =============================================================================
-# 2. Wrapper Channels (修改：传递 edge_weights)
-# =============================================================================
-
-class LigandAtomChannel(nn.Module):
+class LigandAtomChannel(IntraChannel):
     def __init__(self, num_layers, in_dim, hidden_dim, negative_slope):
-        super(LigandAtomChannel, self).__init__()
-        self.encoder = IntraChannel(num_layers, in_dim, hidden_dim, negative_slope, edge_dim=0)
-    def forward(self, g, h, edge_weights=None): 
-        return self.encoder(g, h, edge_weights=edge_weights)
+        super().__init__(num_layers, in_dim, hidden_dim, negative_slope)
 
-class ProteinAtomChannel(nn.Module):
+
+class ProteinAtomChannel(LigandAtomChannel):
+    pass
+
+
+class LigandFragmentChannel(IntraChannel):
     def __init__(self, num_layers, in_dim, hidden_dim, negative_slope):
-        super(ProteinAtomChannel, self).__init__()
-        self.encoder = IntraChannel(num_layers, in_dim, hidden_dim, negative_slope, edge_dim=0)
-    def forward(self, g, h, edge_weights=None): 
-        return self.encoder(g, h, edge_weights=edge_weights)
+        super().__init__(num_layers, in_dim, hidden_dim, negative_slope)
 
-class LigandFragmentChannel(nn.Module):
+
+class ProteinResidueChannel(IntraChannel):
     def __init__(self, num_layers, in_dim, hidden_dim, negative_slope):
-        super(LigandFragmentChannel, self).__init__()
-        self.encoder = IntraChannel(num_layers, in_dim, hidden_dim, negative_slope, edge_dim=0)
-    def forward(self, g, h, edge_weights=None): 
-        return self.encoder(g, h, edge_weights=edge_weights)
-
-class ProteinResidueChannel(nn.Module):
-    def __init__(self, num_layers, in_dim, hidden_dim, negative_slope):
-        super(ProteinResidueChannel, self).__init__()
-        self.encoder = IntraChannel(num_layers, in_dim, hidden_dim, negative_slope, edge_dim=1)
-    def forward(self, g, h, edge_feats, edge_weights=None): 
-        return self.encoder(g, h, edge_feats, edge_weights=edge_weights)
+        super().__init__(num_layers, in_dim, hidden_dim, negative_slope, edge_dim=1)
 
 
-# =============================================================================
-# 3. Inter Channels (保持之前的分子力学版本)
-# =============================================================================
-
-class InterAtomChannel(nn.Module):
-    def __init__(self, l_inter, d, negative_slope=0.2):
-        super(InterAtomChannel, self).__init__()
-        self.l_inter = l_inter
-        self.d = d
+class _InterChannel(nn.Module):
+    def __init__(self, num_layers, dimension, negative_slope=0.2):
+        super().__init__()
+        self.node_projections = nn.ModuleList(
+            nn.Linear(dimension, dimension, bias=False) for _ in range(num_layers)
+        )
+        self.distance_projections = nn.ModuleList(
+            nn.Linear(1, dimension, bias=False) for _ in range(num_layers)
+        )
+        self.attn_src = nn.ParameterList(
+            nn.Parameter(torch.empty(1, dimension)) for _ in range(num_layers)
+        )
+        self.attn_dst = nn.ParameterList(
+            nn.Parameter(torch.empty(1, dimension)) for _ in range(num_layers)
+        )
+        self.attn_edge = nn.ParameterList(
+            nn.Parameter(torch.empty(1, dimension)) for _ in range(num_layers)
+        )
         self.activation = nn.LeakyReLU(negative_slope)
-        self.ligand_linear = nn.Linear(d, d, bias=True)
-        self.protein_linear = nn.Linear(d, d, bias=True)
-        self.attn_l = nn.Parameter(torch.FloatTensor(1, d))
-        self.attn_p = nn.Parameter(torch.FloatTensor(1, d))
-        self.attn_e = nn.Parameter(torch.FloatTensor(1, d)) 
-        self.dist_linear = nn.Linear(1, d) 
-        self.mechanics_mlp = InteractionForceMLP(atom_dim=d, hidden_dim=64)
+        self.mechanics = InteractionForceMLP(atom_dim=dimension, hidden_dim=64)
         self.energy_fusion = nn.Linear(3, 1)
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.xavier_normal_(self.ligand_linear.weight)
-        nn.init.xavier_normal_(self.protein_linear.weight)
-        nn.init.xavier_normal_(self.attn_l)
-        nn.init.xavier_normal_(self.attn_p)
-        nn.init.xavier_normal_(self.attn_e)
-        nn.init.xavier_normal_(self.dist_linear.weight)
-        nn.init.constant_(self.energy_fusion.bias, 2.0) 
-
-    def forward(self, g, h_l, h_p, edge_weights=None):
-        h_all = torch.cat([h_l, h_p], dim=0)
-        
-        with g.local_scope():
-            g.ndata['h'] = h_all
-            raw_dists = g.edata['dist'] # [E, 1]
-            feat_e = self.dist_linear(raw_dists) # [E, d]
-            
-            def compute_mechanics_weights(edges):
-                vdw, elec, hbond = self.mechanics_mlp(edges.src['h'], edges.dst['h'], edges.data['dist'])
-                energies = torch.cat([vdw, elec, hbond], dim=-1)
-                raw_w = self.energy_fusion(energies)
-                w = torch.sigmoid(raw_w)
-                return {'phys_w': w}
-
-            if edge_weights is None:
-                g.apply_edges(compute_mechanics_weights)
-                final_weights = g.edata.pop('phys_w')
-            else:
-                if edge_weights.dim() == 1: edge_weights = edge_weights.unsqueeze(-1)
-                final_weights = edge_weights
-
-            for _ in range(self.l_inter):
-                h_curr = g.ndata['h']
-                el = (h_curr * self.attn_l).sum(dim=-1).unsqueeze(-1)
-                ep = (h_curr * self.attn_p).sum(dim=-1).unsqueeze(-1)
-                ee = (feat_e * self.attn_e).sum(dim=-1).unsqueeze(-1)
-                g.ndata.update({'el': el, 'ep': ep})
-                g.edata['ee'] = ee
-                g.apply_edges(fn.u_add_v('el', 'ep', 'e_nodes'))
-                e = self.activation(g.edata.pop('e_nodes') + g.edata['ee'])
-                
-                a = edge_softmax(g, e)
-                a = a * final_weights
-                
-                # 显式赋值给 edata，防止 update_all 找不到
-                g.edata['a'] = a 
-                
-                g.update_all(fn.u_mul_e('h', 'a', 'm'), fn.sum('m', 'h_new'))
-                g.ndata['h'] = self.activation(g.ndata['h_new'])
-            
-            h_final = g.ndata['h']
-            n_l = h_l.shape[0]
-            
-            return h_final[:n_l], h_final[n_l:]
-
-
-class InterSubstructureChannel(nn.Module):
-    def __init__(self, l_inter, d, negative_slope=0.2):
-        super(InterSubstructureChannel, self).__init__()
-        self.l_inter = l_inter
-        self.d = d
-        self.activation = nn.LeakyReLU(negative_slope)
-        self.ligand_linear = nn.Linear(d, d, bias=True)
-        self.protein_linear = nn.Linear(d, d, bias=True)
-        self.attn_l = nn.Parameter(torch.FloatTensor(1, d))
-        self.attn_p = nn.Parameter(torch.FloatTensor(1, d))
-        self.attn_e = nn.Parameter(torch.FloatTensor(1, d)) 
-        self.dist_linear = nn.Linear(1, d) 
-        self.mechanics_mlp = InteractionForceMLP(atom_dim=d, hidden_dim=64)
-        self.energy_fusion = nn.Linear(3, 1)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.xavier_normal_(self.ligand_linear.weight)
-        nn.init.xavier_normal_(self.protein_linear.weight)
-        nn.init.xavier_normal_(self.attn_l)
-        nn.init.xavier_normal_(self.attn_p)
-        nn.init.xavier_normal_(self.attn_e)
-        nn.init.xavier_normal_(self.dist_linear.weight)
+        for module in list(self.node_projections) + list(self.distance_projections):
+            nn.init.xavier_normal_(module.weight)
+        for parameter in (
+            list(self.attn_src) + list(self.attn_dst) + list(self.attn_edge)
+        ):
+            nn.init.xavier_normal_(parameter)
         nn.init.constant_(self.energy_fusion.bias, 2.0)
 
-    def forward(self, g, h_l, h_p, edge_weights=None):
-        h_all = torch.cat([h_l, h_p], dim=0)
-        
-        with g.local_scope():
-            g.ndata['h'] = h_all
-            raw_dists = g.edata['dist']
-            feat_e = self.dist_linear(raw_dists)
-            
-            def compute_mechanics_weights(edges):
-                vdw, elec, hbond = self.mechanics_mlp(edges.src['h'], edges.dst['h'], edges.data['dist'])
-                energies = torch.cat([vdw, elec, hbond], dim=-1)
-                raw_w = self.energy_fusion(energies)
-                w = torch.sigmoid(raw_w)
-                return {'phys_w': w}
+    def _physical_weights(self, graph, hidden):
+        src, dst = graph.edges()
+        side = graph.ndata["side"]
+        ligand_features = torch.where(
+            (side[src] == 0).unsqueeze(-1), hidden[src], hidden[dst]
+        )
+        protein_features = torch.where(
+            (side[src] == 1).unsqueeze(-1), hidden[src], hidden[dst]
+        )
+        vdw, electrostatic, hydrogen_bond = self.mechanics(
+            ligand_features, protein_features, graph.edata["dist"]
+        )
+        return torch.sigmoid(
+            self.energy_fusion(torch.cat((vdw, electrostatic, hydrogen_bond), dim=-1))
+        )
 
-            if edge_weights is None:
-                g.apply_edges(compute_mechanics_weights)
-                final_weights = g.edata.pop('phys_w')
-            else:
-                if edge_weights.dim() == 1: edge_weights = edge_weights.unsqueeze(-1)
-                final_weights = edge_weights
+    def forward(
+        self,
+        graph,
+        h_ligand,
+        h_protein,
+        ligand_counts,
+        protein_counts,
+        edge_weights=None,
+    ):
+        hidden = pack_bipartite_features(
+            h_ligand, h_protein, ligand_counts, protein_counts
+        )
+        if graph.num_edges() == 0:
+            zeros = torch.zeros_like(hidden)
+            return unpack_bipartite_features(zeros, ligand_counts, protein_counts)
+        contact_gate = (
+            self._physical_weights(graph, hidden)
+            if edge_weights is None
+            else edge_weights.reshape(-1, 1)
+        )
 
-            for _ in range(self.l_inter):
-                h_curr = g.ndata['h']
-                el = (h_curr * self.attn_l).sum(dim=-1).unsqueeze(-1)
-                ep = (h_curr * self.attn_p).sum(dim=-1).unsqueeze(-1)
-                ee = (feat_e * self.attn_e).sum(dim=-1).unsqueeze(-1)
-                g.ndata.update({'el': el, 'ep': ep})
-                g.edata['ee'] = ee
-                g.apply_edges(fn.u_add_v('el', 'ep', 'e_nodes'))
-                e = self.activation(g.edata.pop('e_nodes') + g.edata['ee'])
-                a = edge_softmax(g, e)
-                a = a * final_weights
-                
-                g.edata['a'] = a
-                
-                g.update_all(fn.u_mul_e('h', 'a', 'm'), fn.sum('m', 'h_new'))
-                g.ndata['h'] = self.activation(g.ndata['h_new'])
-            
-            h_final = g.ndata['h']
-            n_l = h_l.shape[0]
-            
-            return h_final[:n_l], h_final[n_l:]
+        with graph.local_scope():
+            for layer_id, projection in enumerate(self.node_projections):
+                projected = projection(hidden)
+                graph.ndata["projected"] = projected
+                graph.ndata["score_src"] = (projected * self.attn_src[layer_id]).sum(
+                    -1, keepdim=True
+                )
+                graph.ndata["score_dst"] = (projected * self.attn_dst[layer_id]).sum(
+                    -1, keepdim=True
+                )
+                graph.apply_edges(fn.u_add_v("score_src", "score_dst", "score"))
+                distance_feature = self.distance_projections[layer_id](
+                    graph.edata["dist"]
+                )
+                score = graph.edata["score"] + (
+                    distance_feature * self.attn_edge[layer_id]
+                ).sum(-1, keepdim=True)
+                attention = edge_softmax(graph, self.activation(score)) * contact_gate
+                graph.edata["attention"] = attention
+                graph.update_all(
+                    fn.u_mul_e("projected", "attention", "message"),
+                    fn.sum("message", "updated"),
+                )
+                hidden = self.activation(graph.ndata["updated"])
+
+        return unpack_bipartite_features(hidden, ligand_counts, protein_counts)
+
+
+class InterAtomChannel(_InterChannel):
+    pass
+
+
+class InterSubstructureChannel(_InterChannel):
+    pass

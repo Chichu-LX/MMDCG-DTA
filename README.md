@@ -1,68 +1,96 @@
 # MMDCG-DTA
 
-Official implementation of **MMDCG-DTA: Molecular Mechanics-Informed Dynamic
-Contact Graph Framework for Predicting Protein-Ligand Binding Affinity**.
+Official implementation of **A Novel Molecular Mechanics-Informed Semantic
+Fusion Framework via Dynamic Contact Graph for Predicting Drug-Target Binding
+Affinity** (MMDCG-DTA).
 
-MMDCG-DTA combines molecular-mechanics priors with dynamically reconstructed
-protein-ligand contact graphs. It learns coupled atom-level and
-substructure-level representations through a three-stage training strategy.
+The public entry point implements the complete three-stage curriculum described
+in the paper:
 
-## Repository Contents
+1. Stage 1 learns the affinity backbone from the static 4 Å atom-contact and
+   8 Å fragment–residue graphs using physical contact gates.
+2. Stage 2 expands atom candidates to 8 Å and alternately trains independent
+   atom and substructure Remove/Keep/Add reconstructors and the affinity model.
+3. Stage 3 freezes both contact-scoring MLPs, recomputes their input-dependent
+   soft weights on every forward pass, and fine-tunes the affinity network.
 
-- `Model/MMDCG_DTA.py`: core MMDCG-DTA model.
-- `Data/MMDCG_DTA_Stage1.py`: molecular-mechanics-informed representation learning.
-- `Data/MMDCG_DTA_Stage2.py`: dynamic interaction-edge reconstruction.
-- `Data/MMDCG_DTA_Stage3.py`: final affinity-prediction fine-tuning.
-- `Data/`: graph construction, featurization, staged model code, and training utilities.
-- `Utils/`: evaluation metrics.
-- `train.py`: training entry point.
-
-Large datasets, graph caches, trained checkpoints, logs, virtual environments,
-and local server artifacts are intentionally excluded from this open-source
-release.
+Only the main graph-construction, model, training, and test code is included.
+Case-study, virtual-screening, and binding-site-analysis scripts are intentionally
+excluded.
 
 ## Installation
 
-Create a Python environment, then install the dependencies:
+Python 3.9 was used for the released dependency set.
 
 ```bash
 python -m venv mmdcg_dta_env
 source mmdcg_dta_env/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-The original experiments used CUDA-enabled PyTorch and DGL versions listed in
-`requirements.txt`. Install the matching wheels for your CUDA environment when
-needed.
+For CUDA training, install the PyTorch build appropriate for the local CUDA
+driver before installing the remaining requirements. DGL 1.1.2 is used because
+it is available from the standard Python package index; CUDA-specific DGL wheels
+may instead be installed from DGL's official wheel repository.
 
-## Data Preparation
+## Data preparation
 
-Place the PDBbind data under:
+Place PDBbind data in this layout:
 
 ```text
 Data/PDBbind_dataset/
+├── core-set/
+└── refined-set/
 ```
 
-Then build graph datasets:
+Place the PDBbind affinity index at `Data/INDEX_data.2016`, then run from the
+repository root:
 
 ```bash
-cd Data
-python build_graph_dataset.py
+python -m Data.loader
+python -m Data.build_graph_dataset
 ```
 
-This generates graph cache files such as `refined_set_graphs.pkl` and
-`core_set_graphs.pkl`. These files are not committed because they are generated
-artifacts.
+The graph builder writes exact BRICS atom-to-fragment and PDB atom-to-residue
+memberships into the cache. It also writes both `atom_interaction_graph` (4 Å)
+and `atom_candidate_graph` (8 Å). Caches produced by older releases must be
+rebuilt; the training pipeline deliberately does not infer hierarchy memberships
+with geometric K-means.
 
-## Training
+## Training and evaluation
 
-From the repository root:
+Run all three stages:
 
 ```bash
 python train.py
 ```
 
-Training configuration is stored in `default.yaml`.
+Or resume an individual stage after its predecessor's checkpoint exists:
+
+```bash
+python train.py --stage 2
+python train.py --stage 3
+```
+
+All paper-level architecture and optimization settings are centralized in
+`default.yaml`: batch size 16, 64-dimensional hidden states, two layers/steps,
+Stage 1/2/3 learning rates of `1e-4`, `5e-5`, and `1e-4`, and at most five
+Stage-2 inner iterations with a 0.01 topology-change tolerance.
+
+The Refined cache is split deterministically into training and validation data,
+after excluding every complex present in the Core cache. Early stopping and
+checkpoint selection use validation RMSE only. The Core set is evaluated once
+after the best Stage-3 checkpoint is restored, and the results are written to
+`results/training/core_test_metrics.json`.
+
+## Verification
+
+The smoke tests construct a two-sample DGL batch and exercise Stage-1
+forward/backward propagation, both Stage-2 reconstructors, and Stage-3 freezing:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## License
 

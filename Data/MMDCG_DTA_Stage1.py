@@ -1,237 +1,387 @@
+"""Stage-1 molecular-mechanics-informed MMDCG-DTA backbone."""
+
+from __future__ import annotations
+
+import dgl
 import torch
 import torch.nn as nn
-import dgl
-from channels import (
-    LigandAtomChannel, ProteinAtomChannel, InterAtomChannel,
-    LigandFragmentChannel, ProteinResidueChannel, InterSubstructureChannel
+
+from .channels import (
+    InterAtomChannel,
+    InterSubstructureChannel,
+    LigandAtomChannel,
+    LigandFragmentChannel,
+    ProteinAtomChannel,
+    ProteinResidueChannel,
+    pack_bipartite_features,
 )
-from hil import (
-    AtomLevelInteractiveLigand, AtomLevelInteractiveProtein,
-    SubstructureLevelInteractiveLigand, SubstructureLevelInteractiveProtein
+from .hil import (
+    AtomLevelInteractiveLigand,
+    AtomLevelInteractiveProtein,
+    SubstructureLevelInteractiveLigand,
+    SubstructureLevelInteractiveProtein,
 )
-from mechanics import BondEnergyMLP, AngleDihedralEnergyMLP, InteractionForceMLP
+from .mechanics import AngleDihedralEnergyMLP, BondEnergyMLP
+
 
 class MMDCGDTAModel_Stage1(nn.Module):
     def __init__(self, config):
-        super(MMDCGDTAModel_Stage1, self).__init__()
-        # === 配置 ===
-        self.l_intra = config["l_intra"]
-        self.l_inter = config["l_inter"]
-        self.l_atom = config["l_atom"]
-        self.l_sub = config["l_sub"]
-        self.d = config["embedding_dim"]
-        self.neg_slope = config["inter_negative_slope"]
-        self.d_atom = config["d_atom"]
-        self.d_sub = config["d_sub"]
-        self.use_checkpoint = config.get("use_checkpoint", True)
+        super().__init__()
+        self.d_atom_hidden = int(config["embedding_dim"])
+        self.d_sub_hidden = int(
+            config.get("substructure_embedding_dim", self.d_atom_hidden)
+        )
+        self.use_checkpoint = bool(config.get("use_checkpoint", True))
+        negative_slope = float(config["inter_negative_slope"])
+        temperature = float(config.get("hil_temperature", 1.0))
 
-        self.raw_atom_dim = config.get("raw_atom_dim", 5) 
-        self.sub_x_dim = config.get("sub_x_dim", 5)
-        self.prot_res_dim = config.get("prot_res_dim", 1)
+        self.ligand_atom_intra_encoder = LigandAtomChannel(
+            config["l_intra"],
+            config.get("raw_atom_dim", 5),
+            self.d_atom_hidden,
+            negative_slope,
+        )
+        self.protein_atom_intra_encoder = ProteinAtomChannel(
+            config["l_intra"],
+            config.get("raw_atom_dim", 5),
+            self.d_atom_hidden,
+            negative_slope,
+        )
+        self.inter_atom_encoder = InterAtomChannel(
+            config["l_inter"], self.d_atom_hidden, negative_slope
+        )
+        atom_hil = dict(
+            num_steps=config["l_atom"],
+            dimension=self.d_atom_hidden,
+            temperature=temperature,
+            negative_slope=negative_slope,
+            use_checkpoint=self.use_checkpoint,
+        )
+        self.ligand_atom_interactive = AtomLevelInteractiveLigand(**atom_hil)
+        self.protein_atom_interactive = AtomLevelInteractiveProtein(**atom_hil)
 
-        # === 编码器 ===
-        self.ligand_atom_intra_encoder = LigandAtomChannel(self.l_intra, self.raw_atom_dim, self.d, self.neg_slope)
-        self.protein_atom_intra_encoder = ProteinAtomChannel(self.l_intra, self.raw_atom_dim, self.d, self.neg_slope)
-        self.inter_atom_encoder = InterAtomChannel(self.l_inter, self.d, self.neg_slope)
-        
-        self.ligand_atom_interactive = AtomLevelInteractiveLigand(self.l_atom, self.d, use_checkpoint=self.use_checkpoint)
-        self.protein_atom_interactive = AtomLevelInteractiveProtein(self.l_atom, self.d, use_checkpoint=self.use_checkpoint)
+        ligand_sub_input = config.get("sub_x_dim", 5) + self.d_atom_hidden
+        protein_sub_input = config.get("prot_res_dim", 1) + self.d_atom_hidden
+        self.fragment_projection = nn.Linear(ligand_sub_input, self.d_sub_hidden)
+        self.residue_projection = nn.Linear(protein_sub_input, self.d_sub_hidden)
+        self.ligand_fragment_intra_encoder = LigandFragmentChannel(
+            config["l_intra"], self.d_sub_hidden, self.d_sub_hidden, negative_slope
+        )
+        self.protein_residue_intra_encoder = ProteinResidueChannel(
+            config["l_intra"], self.d_sub_hidden, self.d_sub_hidden, negative_slope
+        )
+        self.inter_substructure_encoder = InterSubstructureChannel(
+            config["l_inter"], self.d_sub_hidden, negative_slope
+        )
+        sub_hil = dict(
+            num_steps=config["l_sub"],
+            dimension=self.d_sub_hidden,
+            temperature=temperature,
+            negative_slope=negative_slope,
+            use_checkpoint=self.use_checkpoint,
+        )
+        self.ligand_substructure_interactive = SubstructureLevelInteractiveLigand(
+            **sub_hil
+        )
+        self.protein_substructure_interactive = SubstructureLevelInteractiveProtein(
+            **sub_hil
+        )
 
-        # === Substructure 模块 ===
-        raw_frag_in_dim = self.sub_x_dim + self.d
-        raw_res_in_dim = self.prot_res_dim + self.d
-        self.unified_sub_dim = self.d + self.sub_x_dim
-        
-        self.frag_proj = nn.Linear(raw_frag_in_dim, self.unified_sub_dim) 
-        self.res_proj = nn.Linear(raw_res_in_dim, self.unified_sub_dim)   
-        
-        self.ligand_frag_intra_encoder = LigandFragmentChannel(self.l_intra, self.unified_sub_dim, self.unified_sub_dim, self.neg_slope)
-        self.protein_res_intra_encoder = ProteinResidueChannel(self.l_intra, self.unified_sub_dim, self.unified_sub_dim, self.neg_slope)
-        
-        self.inter_sub_encoder = InterSubstructureChannel(self.l_inter, self.unified_sub_dim, self.neg_slope)
-        
-        self.ligand_sub_interactive = SubstructureLevelInteractiveLigand(self.l_sub, self.unified_sub_dim, self.neg_slope, use_checkpoint=self.use_checkpoint)
-        self.protein_sub_interactive = SubstructureLevelInteractiveProtein(self.l_sub, self.unified_sub_dim, self.neg_slope, use_checkpoint=self.use_checkpoint)
+        self.ligand_atom_bond_simulator = BondEnergyMLP(hidden_dim=32)
+        self.protein_atom_bond_simulator = BondEnergyMLP(hidden_dim=32)
+        self.ligand_atom_angle_simulator = AngleDihedralEnergyMLP(
+            self.d_atom_hidden, hidden_dim=32
+        )
+        self.protein_atom_angle_simulator = AngleDihedralEnergyMLP(
+            self.d_atom_hidden, hidden_dim=32
+        )
+        self.ligand_sub_bond_simulator = BondEnergyMLP(hidden_dim=32)
+        self.protein_sub_bond_simulator = BondEnergyMLP(hidden_dim=32)
 
-        # === 分子力学模拟模块 ===
-        self.ligand_bond_sim = BondEnergyMLP(hidden_dim=32)
-        self.ligand_angle_sim = AngleDihedralEnergyMLP(in_dim=self.d, hidden_dim=32)
-        self.protein_bond_sim = BondEnergyMLP(hidden_dim=32)
-        self.protein_angle_sim = AngleDihedralEnergyMLP(in_dim=self.d, hidden_dim=32)
-        self.inter_force_sim = InteractionForceMLP(atom_dim=self.d, hidden_dim=64)
+        fusion_dimension = 4 * self.d_sub_hidden + 9
+        self.readout_gru = nn.GRU(
+            input_size=fusion_dimension,
+            hidden_size=fusion_dimension,
+            batch_first=True,
+        )
+        self.affinity_regressor = nn.Linear(fusion_dimension, 1)
 
-        # === 融合与预测 ===
-        self.fusion_dim = 4 * self.unified_sub_dim + 9 
-        self.gru = nn.GRU(input_size=self.fusion_dim, hidden_size=self.fusion_dim, batch_first=True)
-        self.pred_fc = nn.Linear(self.fusion_dim, 1)
+    @staticmethod
+    def _batch_size(graph):
+        return len(graph.batch_num_nodes())
 
-    def _get_batch_offset_group_ids(self, atom_graph, sub_graph, group_key="group"):
+    @staticmethod
+    def _batch_group_ids(atom_graph, substructure_graph):
         device = atom_graph.device
-        sub_batch_num_nodes = sub_graph.batch_num_nodes().to(device)
-        cumsum = torch.cumsum(sub_batch_num_nodes, dim=0)
-        offsets = torch.cat([torch.zeros(1, dtype=torch.long, device=device), cumsum[:-1]])
-        atom_batch_num_nodes = atom_graph.batch_num_nodes().to(device)
-        atom_offsets = torch.repeat_interleave(offsets, atom_batch_num_nodes)
-        if group_key not in atom_graph.ndata:
-             raise ValueError(f"CRITICAL ERROR: '{group_key}' not found.")
-        local_group_ids = atom_graph.ndata[group_key].long()
-        return local_group_ids + atom_offsets
+        sub_counts = substructure_graph.batch_num_nodes().to(device)
+        sub_offsets = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.long, device=device),
+                torch.cumsum(sub_counts, dim=0)[:-1],
+            )
+        )
+        atom_counts = atom_graph.batch_num_nodes().to(device)
+        offsets_per_atom = torch.repeat_interleave(sub_offsets, atom_counts)
+        if "group" not in atom_graph.ndata:
+            raise ValueError(
+                "graph cache has no exact atom-to-substructure mapping; rebuild it with "
+                "`python -m Data.build_graph_dataset`"
+            )
+        local_groups = atom_graph.ndata["group"].long()
+        if torch.any(local_groups < 0):
+            raise ValueError("negative atom-to-substructure group ID")
+        return local_groups + offsets_per_atom
 
-    # [辅助方法] 将能量转换为 0~1 权重 (Sigmoid)
-    def _bond_energy_to_weight(self, bond_energy):
-        return torch.sigmoid(-bond_energy)
+    @staticmethod
+    def _sample_group_ids(graph):
+        counts = graph.batch_num_nodes().to(graph.device)
+        return torch.repeat_interleave(
+            torch.arange(len(counts), device=graph.device), counts
+        )
 
-    # [核心] 计算键能并返回用于 GAT 的权重
-    def _calc_bond_energy_weights(self, graph, model, pos_key='pos'):
+    @staticmethod
+    def _group_mean(values, group_ids, num_groups):
+        totals = torch.zeros(
+            num_groups, values.shape[-1], device=values.device, dtype=values.dtype
+        )
+        totals.index_add_(0, group_ids, values)
+        counts = torch.zeros(num_groups, 1, device=values.device, dtype=values.dtype)
+        counts.index_add_(
+            0,
+            group_ids,
+            torch.ones(values.shape[0], 1, device=values.device, dtype=values.dtype),
+        )
+        return totals / counts.clamp_min(1.0)
+
+    def _bond_terms(self, graph, simulator):
+        if graph.num_edges() == 0:
+            aggregate = torch.zeros(self._batch_size(graph), 1, device=graph.device)
+            return aggregate, torch.empty(0, 1, device=graph.device)
         src, dst = graph.edges()
-        pos = graph.ndata[pos_key]
-        dist = torch.norm(pos[src] - pos[dst], dim=-1, keepdim=True)
-        
-        # 计算每条边的能量
-        energy_edges = model(dist)
-        
-        # 转换为 GAT 权重
-        weights = self._bond_energy_to_weight(energy_edges)
-        
-        # 同时计算聚合能量 (用于最终特征融合)
+        distances = torch.linalg.norm(
+            graph.ndata["pos"][src] - graph.ndata["pos"][dst], dim=-1, keepdim=True
+        )
+        energies = simulator(distances)
+        weights = torch.sigmoid(-energies)
         with graph.local_scope():
-            graph.edata['e'] = energy_edges
-            g_energy_agg = dgl.readout_edges(graph, 'e', weight=None, op='mean')
-            
-        return g_energy_agg, weights
+            graph.edata["bond_energy"] = energies
+            aggregate = dgl.readout_edges(graph, "bond_energy", op="mean")
+        return aggregate, weights
 
-    def _calc_angle_energy(self, graph, model, node_h):
-        E_angle, E_torsion = model(node_h)
+    @staticmethod
+    def _angle_terms(graph, simulator, hidden):
+        angle, torsion = simulator(hidden)
         with graph.local_scope():
-            graph.ndata['tmp_angle_energy'] = E_angle
-            graph.ndata['tmp_torsion_energy'] = E_torsion
-            g_angle = dgl.readout_nodes(graph, 'tmp_angle_energy', op='mean')
-            g_torsion = dgl.readout_nodes(graph, 'tmp_torsion_energy', op='mean')
-        return g_angle, g_torsion
+            graph.ndata["angle"] = angle
+            graph.ndata["torsion"] = torsion
+            return (
+                dgl.readout_nodes(graph, "angle", op="mean"),
+                dgl.readout_nodes(graph, "torsion", op="mean"),
+            )
 
-    def _calc_inter_energy(self, g, h_l, h_p):
-        h_all = torch.cat([h_l, h_p], dim=0)
-        with g.local_scope():
-            src, dst = g.edges()
-            h_src = h_all[src]
-            h_dst = h_all[dst]
-            d_val = g.edata['dist']
-            
-            E_vdw_edge, E_elec_edge, E_hbond_edge = self.inter_force_sim(h_src, h_dst, d_val)
-            
-            g.edata['E_vdw'] = E_vdw_edge
-            g.edata['E_elec'] = E_elec_edge
-            g.edata['E_hbond'] = E_hbond_edge
-            
-            E_vdw_batch = dgl.readout_edges(g, 'E_vdw', op='sum') 
-            E_elec_batch = dgl.readout_edges(g, 'E_elec', op='sum')
-            E_hbond_batch = dgl.readout_edges(g, 'E_hbond', op='sum')
-            
-        return E_vdw_batch, E_elec_batch, E_hbond_batch
+    def _atom_interaction_terms(
+        self, graph, ligand_hidden, protein_hidden, ligand_counts, protein_counts
+    ):
+        if graph.num_edges() == 0:
+            zeros = torch.zeros(self._batch_size(graph), 1, device=graph.device)
+            return (zeros, zeros.clone(), zeros.clone()), torch.empty(
+                0, 1, device=graph.device
+            )
+        packed = pack_bipartite_features(
+            ligand_hidden, protein_hidden, ligand_counts, protein_counts
+        )
+        src, dst = graph.edges()
+        side = graph.ndata["side"]
+        ligand_features = torch.where(
+            (side[src] == 0).unsqueeze(-1), packed[src], packed[dst]
+        )
+        protein_features = torch.where(
+            (side[src] == 1).unsqueeze(-1), packed[src], packed[dst]
+        )
+        vdw, electrostatic, hydrogen_bond = self.inter_atom_encoder.mechanics(
+            ligand_features, protein_features, graph.edata["dist"]
+        )
+        physical_weights = torch.sigmoid(
+            self.inter_atom_encoder.energy_fusion(
+                torch.cat((vdw, electrostatic, hydrogen_bond), dim=-1)
+            )
+        )
+        with graph.local_scope():
+            graph.edata["vdw"] = vdw
+            graph.edata["electrostatic"] = electrostatic
+            graph.edata["hydrogen_bond"] = hydrogen_bond
+            # Every undirected candidate is represented by two directed edges.
+            summaries = tuple(
+                0.5 * dgl.readout_edges(graph, key, op="sum")
+                for key in ("vdw", "electrostatic", "hydrogen_bond")
+            )
+        return summaries, physical_weights
 
-    def forward(self, sample):
-        # 1. 提取图
+    @staticmethod
+    def _mean_pool(graph, hidden):
+        with graph.local_scope():
+            graph.ndata["readout"] = hidden
+            return dgl.readout_nodes(graph, "readout", op="mean")
+
+    def _reconstruct_contacts(self, hierarchy, graph, ligand_hidden, protein_hidden):
+        """Stage-1 hook: physical gates are used instead of dynamic weights."""
+        return None, {}
+
+    def _forward_backbone(self, sample, dynamic_contacts=False):
         ligand_atom_graph = sample["ligand_atom_graph"]
         protein_atom_graph = sample["protein_atom_graph"]
-        atom_interaction_graph = sample["atom_interaction_graph"]
-        substructure_interaction_graph = sample["substructure_interaction_graph"]
-        
-        # === 2. [调整] 先计算内轨物理权重 ===
-        
-        # 配体内部键能权重
-        L_E_bond_agg, L_bond_weights = self._calc_bond_energy_weights(
-            ligand_atom_graph, self.ligand_bond_sim
+        ligand_fragment_graph = sample["ligand_fragment_graph"]
+        protein_residue_graph = sample["protein_residue_graph"]
+        atom_graph = (
+            sample["atom_candidate_graph"]
+            if dynamic_contacts
+            else sample["atom_interaction_graph"]
         )
-        
-        # 蛋白内部键能权重
-        P_E_bond_agg, P_bond_weights = self._calc_bond_energy_weights(
-            protein_atom_graph, self.protein_bond_sim
-        )
+        substructure_graph = sample["substructure_interaction_graph"]
+        ligand_atom_counts = ligand_atom_graph.batch_num_nodes()
+        protein_atom_counts = protein_atom_graph.batch_num_nodes()
+        ligand_sub_counts = ligand_fragment_graph.batch_num_nodes()
+        protein_sub_counts = protein_residue_graph.batch_num_nodes()
 
-        # === 3. Intra 编码 (融入内部物理权重) ===
-        ligand_intra = self.ligand_atom_intra_encoder(
-            ligand_atom_graph, 
+        ligand_bond, ligand_bond_weights = self._bond_terms(
+            ligand_atom_graph, self.ligand_atom_bond_simulator
+        )
+        protein_bond, protein_bond_weights = self._bond_terms(
+            protein_atom_graph, self.protein_atom_bond_simulator
+        )
+        ligand_atom_intra = self.ligand_atom_intra_encoder(
+            ligand_atom_graph,
             ligand_atom_graph.ndata["h"],
-            edge_weights=L_bond_weights # 传入权重
+            edge_weights=ligand_bond_weights,
         )
-        protein_intra = self.protein_atom_intra_encoder(
-            protein_atom_graph, 
+        protein_atom_intra = self.protein_atom_intra_encoder(
+            protein_atom_graph,
             protein_atom_graph.ndata["h"],
-            edge_weights=P_bond_weights # 传入权重
+            edge_weights=protein_bond_weights,
         )
-        
-        # === 4. 其他物理模拟 ===
-        L_E_angle, L_E_torsion = self._calc_angle_energy(ligand_atom_graph, self.ligand_angle_sim, ligand_intra)
-        P_E_angle, P_E_torsion = self._calc_angle_energy(protein_atom_graph, self.protein_angle_sim, protein_intra)
-        
-        I_E_vdw, I_E_elec, I_E_hbond = self._calc_inter_energy(atom_interaction_graph, ligand_intra, protein_intra)
-
-        # === 5. 交互编码 ===
-        inter_lig, inter_prot = self.inter_atom_encoder(atom_interaction_graph, ligand_intra, protein_intra)
-
-        # === 6. HIL & Substructure ===
-        ligand_group = self._get_batch_offset_group_ids(ligand_atom_graph, sample["ligand_fragment_graph"], "group")
-        protein_group = self._get_batch_offset_group_ids(protein_atom_graph, sample["protein_residue_graph"], "group")
-        
-        updated_inter_lig, updated_intra_lig = self.ligand_atom_interactive(ligand_intra, inter_lig, ligand_group)
-        updated_inter_prot, updated_intra_prot = self.protein_atom_interactive(protein_intra, inter_prot, protein_group)
-        
-        H_lig_atom_final = updated_intra_lig
-        H_prot_atom_final = updated_intra_prot
-
-        ligand_frag_graph = sample["ligand_fragment_graph"]
-        protein_res_graph = sample["protein_residue_graph"]
-
-        num_frags_total = ligand_frag_graph.num_nodes()
-        atom_sum_lig = torch.zeros(num_frags_total, self.d, device=ligand_atom_graph.device)
-        atom_sum_lig.index_add_(0, ligand_group, H_lig_atom_final)
-        new_ligand_feats = torch.cat([ligand_frag_graph.ndata["h"], atom_sum_lig], dim=1)
-
-        num_res_total = protein_res_graph.num_nodes()
-        atom_sum_prot = torch.zeros(num_res_total, self.d, device=protein_atom_graph.device)
-        atom_sum_prot.index_add_(0, protein_group, H_prot_atom_final)
-        new_protein_feats = torch.cat([protein_res_graph.ndata["h"], atom_sum_prot], dim=1)
-
-        ligand_sub_input = self.frag_proj(new_ligand_feats)   
-        protein_sub_input = self.res_proj(new_protein_feats)  
-
-        ligand_intra_sub = self.ligand_frag_intra_encoder(ligand_frag_graph, ligand_sub_input)
-        
-        prot_edge_feats = protein_res_graph.edata['dist'] if 'dist' in protein_res_graph.edata else None
-        protein_intra_sub = self.protein_res_intra_encoder(protein_res_graph, protein_sub_input, prot_edge_feats)
-
-        inter_lig_sub, inter_prot_sub = self.inter_sub_encoder(
-            substructure_interaction_graph,
-            ligand_intra_sub, 
-            protein_intra_sub
+        ligand_angle, ligand_torsion = self._angle_terms(
+            ligand_atom_graph, self.ligand_atom_angle_simulator, ligand_atom_intra
+        )
+        protein_angle, protein_torsion = self._angle_terms(
+            protein_atom_graph, self.protein_atom_angle_simulator, protein_atom_intra
+        )
+        atom_physics, atom_physical_weights = self._atom_interaction_terms(
+            atom_graph,
+            ligand_atom_intra,
+            protein_atom_intra,
+            ligand_atom_counts,
+            protein_atom_counts,
+        )
+        atom_weights, atom_auxiliary = (
+            self._reconstruct_contacts(
+                "atom", atom_graph, ligand_atom_intra, protein_atom_intra
+            )
+            if dynamic_contacts
+            else (atom_physical_weights, {})
+        )
+        ligand_atom_inter, protein_atom_inter = self.inter_atom_encoder(
+            atom_graph,
+            ligand_atom_intra,
+            protein_atom_intra,
+            ligand_atom_counts,
+            protein_atom_counts,
+            edge_weights=atom_weights,
         )
 
-        ligand_sub_updated_inter, ligand_sub_updated_intra = self.ligand_sub_interactive(ligand_intra_sub, inter_lig_sub)
-        protein_sub_updated_inter, protein_sub_updated_intra = self.protein_sub_interactive(protein_intra_sub, inter_prot_sub)
+        ligand_groups = self._batch_group_ids(ligand_atom_graph, ligand_fragment_graph)
+        protein_groups = self._batch_group_ids(
+            protein_atom_graph, protein_residue_graph
+        )
+        ligand_atom_inter, ligand_atom_intra = self.ligand_atom_interactive(
+            ligand_atom_intra, ligand_atom_inter, ligand_groups
+        )
+        protein_atom_inter, protein_atom_intra = self.protein_atom_interactive(
+            protein_atom_intra, protein_atom_inter, protein_groups
+        )
 
-        def safe_mean_nodes(g, feat):
-            with g.local_scope():
-                g.ndata['tmp_readout'] = feat
-                return dgl.readout_nodes(g, 'tmp_readout', op='mean')
+        ligand_atom_mean = self._group_mean(
+            ligand_atom_intra, ligand_groups, ligand_fragment_graph.num_nodes()
+        )
+        protein_atom_mean = self._group_mean(
+            protein_atom_intra, protein_groups, protein_residue_graph.num_nodes()
+        )
+        ligand_sub_input = self.fragment_projection(
+            torch.cat((ligand_fragment_graph.ndata["h"], ligand_atom_mean), dim=-1)
+        )
+        protein_sub_input = self.residue_projection(
+            torch.cat((protein_residue_graph.ndata["h"], protein_atom_mean), dim=-1)
+        )
 
-        ligand_pool_intra = safe_mean_nodes(ligand_frag_graph, ligand_sub_updated_intra)
-        protein_pool_intra = safe_mean_nodes(protein_res_graph, protein_sub_updated_intra)
-        ligand_pool_inter = safe_mean_nodes(ligand_frag_graph, ligand_sub_updated_inter)
-        protein_pool_inter = safe_mean_nodes(protein_res_graph, protein_sub_updated_inter)
+        _ligand_sub_bond, ligand_sub_bond_weights = self._bond_terms(
+            ligand_fragment_graph, self.ligand_sub_bond_simulator
+        )
+        _protein_sub_bond, protein_sub_bond_weights = self._bond_terms(
+            protein_residue_graph, self.protein_sub_bond_simulator
+        )
+        ligand_sub_intra = self.ligand_fragment_intra_encoder(
+            ligand_fragment_graph,
+            ligand_sub_input,
+            edge_weights=ligand_sub_bond_weights,
+        )
+        protein_sub_intra = self.protein_residue_intra_encoder(
+            protein_residue_graph,
+            protein_sub_input,
+            edge_features=protein_residue_graph.edata["dist"],
+            edge_weights=protein_sub_bond_weights,
+        )
+        sub_weights, sub_auxiliary = (
+            self._reconstruct_contacts(
+                "substructure", substructure_graph, ligand_sub_intra, protein_sub_intra
+            )
+            if dynamic_contacts
+            else (None, {})
+        )
+        ligand_sub_inter, protein_sub_inter = self.inter_substructure_encoder(
+            substructure_graph,
+            ligand_sub_intra,
+            protein_sub_intra,
+            ligand_sub_counts,
+            protein_sub_counts,
+            edge_weights=sub_weights,
+        )
 
-        H_gnn = torch.cat([ligand_pool_intra, protein_pool_intra, ligand_pool_inter, protein_pool_inter], dim=1)
-        
-        H_physics = torch.cat([
-            L_E_bond_agg, L_E_angle, L_E_torsion,  # 使用聚合后的键能
-            P_E_bond_agg, P_E_angle, P_E_torsion,
-            I_E_vdw, I_E_elec, I_E_hbond
-        ], dim=1)
+        ligand_sub_groups = self._sample_group_ids(ligand_fragment_graph)
+        protein_sub_groups = self._sample_group_ids(protein_residue_graph)
+        ligand_sub_inter, ligand_sub_intra = self.ligand_substructure_interactive(
+            ligand_sub_intra, ligand_sub_inter, ligand_sub_groups
+        )
+        protein_sub_inter, protein_sub_intra = self.protein_substructure_interactive(
+            protein_sub_intra, protein_sub_inter, protein_sub_groups
+        )
 
-        F_final = torch.cat([H_gnn, H_physics], dim=1)
-        
-        F_final = F_final.unsqueeze(1) 
-        gru_out, _ = self.gru(F_final)
-        fusion_rep = gru_out.squeeze(1)
+        graph_summary = torch.cat(
+            (
+                self._mean_pool(ligand_fragment_graph, ligand_sub_intra),
+                self._mean_pool(protein_residue_graph, protein_sub_intra),
+                self._mean_pool(ligand_fragment_graph, ligand_sub_inter),
+                self._mean_pool(protein_residue_graph, protein_sub_inter),
+            ),
+            dim=-1,
+        )
+        physics_summary = torch.cat(
+            (
+                ligand_bond,
+                ligand_angle,
+                ligand_torsion,
+                protein_bond,
+                protein_angle,
+                protein_torsion,
+                *atom_physics,
+            ),
+            dim=-1,
+        )
+        final_features = torch.cat((graph_summary, physics_summary), dim=-1).unsqueeze(
+            1
+        )
+        fused, _ = self.readout_gru(final_features)
+        prediction = self.affinity_regressor(fused.squeeze(1))
+        return prediction, {"atom": atom_auxiliary, "substructure": sub_auxiliary}
 
-        y_pred = self.pred_fc(fusion_rep)
-        return y_pred
+    def forward(self, sample):
+        prediction, _auxiliary = self._forward_backbone(sample, dynamic_contacts=False)
+        return prediction

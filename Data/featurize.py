@@ -34,11 +34,13 @@ def featurize_atom(atom):
         hyb_val = -1
 
     try:
-        gasteiger = float(atom.GetProp('_GasteigerCharge'))
+        gasteiger = float(atom.GetProp("_GasteigerCharge"))
     except Exception:
         gasteiger = 0.0
 
-    return np.array([atomic_num, formal_charge, aromatic, hyb_val, gasteiger], dtype=np.float32)
+    return np.array(
+        [atomic_num, formal_charge, aromatic, hyb_val, gasteiger], dtype=np.float32
+    )
 
 
 def featurize_substructure(substructure, node_type="ligand"):
@@ -67,8 +69,12 @@ def featurize_substructure(substructure, node_type="ligand"):
         tpsa = Descriptors.TPSA(substructure)
         rot_bonds = Descriptors.NumRotatableBonds(substructure)
         # 总形式电荷
-        formal_charge = sum([atom.GetFormalCharge() for atom in substructure.GetAtoms()])
-        features = np.array([mw, logp, tpsa, rot_bonds, formal_charge], dtype=np.float32)
+        formal_charge = sum(
+            [atom.GetFormalCharge() for atom in substructure.GetAtoms()]
+        )
+        features = np.array(
+            [mw, logp, tpsa, rot_bonds, formal_charge], dtype=np.float32
+        )
         return features
     elif node_type == "protein":
         # 处理蛋白残基，substructure 为 Biopython 的 Residue 对象
