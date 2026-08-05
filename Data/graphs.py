@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from typing import Optional
 
 import dgl
 import numpy as np
@@ -19,7 +20,7 @@ def _finite(values: np.ndarray) -> np.ndarray:
     return np.nan_to_num(values, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)
 
 
-def safe_read_sdf(sdf_content: str, sample_name: str = "") -> Chem.Mol | None:
+def safe_read_sdf(sdf_content: str, sample_name: str = "") -> Optional[Chem.Mol]:
     mol = Chem.MolFromMolBlock(sdf_content, removeHs=False)
     if mol is None:
         mol = Chem.MolFromMolBlock(sdf_content, removeHs=False, sanitize=False)
@@ -104,6 +105,8 @@ def build_ligand_atom_graph(
 
     conformer = mol.GetConformer()
     features = _finite(np.asarray([featurize_atom(atom) for atom in mol.GetAtoms()]))
+    if np.any(features[:, 3] < 0):
+        return _empty_graph()
     positions = _finite(
         np.asarray(
             [
@@ -134,11 +137,24 @@ def build_ligand_atom_graph(
 def build_protein_atom_graph(
     protein_pdb_content: str, sample_name: str = ""
 ) -> dgl.DGLGraph:
-    mol = Chem.MolFromPDBBlock(protein_pdb_content, removeHs=False, sanitize=False)
+    mol = Chem.MolFromPDBBlock(protein_pdb_content, removeHs=False, sanitize=True)
+    if mol is None:
+        mol = Chem.MolFromPDBBlock(protein_pdb_content, removeHs=False, sanitize=False)
     if mol is None or mol.GetNumConformers() == 0:
         return _empty_graph()
     try:
         mol.UpdatePropertyCache(strict=False)
+        Chem.SanitizeMol(
+            mol,
+            sanitizeOps=(
+                Chem.SanitizeFlags.SANITIZE_PROPERTIES
+                | Chem.SanitizeFlags.SANITIZE_SYMMRINGS
+                | Chem.SanitizeFlags.SANITIZE_KEKULIZE
+                | Chem.SanitizeFlags.SANITIZE_SETAROMATICITY
+                | Chem.SanitizeFlags.SANITIZE_SETCONJUGATION
+                | Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION
+            ),
+        )
         AllChem.ComputeGasteigerCharges(mol)
         residues = _protein_residues(protein_pdb_content)
     except Exception:
@@ -169,6 +185,8 @@ def build_protein_atom_graph(
     features = _finite(
         np.asarray([featurize_atom(mol.GetAtomWithIdx(i)) for i in selected])
     )
+    if np.any(features[:, 3] < 0):
+        return _empty_graph()
     positions = _finite(
         np.asarray(
             [

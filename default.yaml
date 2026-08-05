@@ -17,6 +17,10 @@ sub_x_dim: 5
 prot_res_dim: 1
 embedding_dim: 64
 substructure_embedding_dim: 64
+readout_hidden_dim: 64
+covalent_hidden_dim: 32
+noncovalent_hidden_dim: 64
+edge_reconstructor_hidden_dim: 64
 l_intra: 2
 l_inter: 2
 l_atom: 2

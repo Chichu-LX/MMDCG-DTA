@@ -232,7 +232,12 @@ def train_stage1(config, loaders, device, output_dir):
 
 
 def _edge_targets(graph):
-    distances = graph.edata["dist"].reshape(-1)
+    if graph.num_edges() % 2:
+        raise ValueError("contact graphs must contain two directions per pair")
+    distances = graph.edata["dist"].reshape(-1)[0::2]
+    pair_ids = graph.edata.get("pair_id")
+    if pair_ids is None or not torch.equal(pair_ids[0::2], pair_ids[1::2]):
+        raise ValueError("contact graph directions are not adjacent pair entries")
     labels = torch.zeros_like(distances, dtype=torch.long)
     labels[(distances >= 3.5) & (distances < 6.0)] = 1
     labels[distances < 3.5] = 2
@@ -282,10 +287,15 @@ def train_stage2(config, loaders, device, output_dir):
         ],
         lr=config["stage2_learning_rate"],
     )
+    reconstructor_parameter_ids = {
+        id(parameter)
+        for reconstructor in model.reconstructors
+        for parameter in reconstructor.parameters()
+    }
     main_parameters = [
         parameter
-        for name, parameter in model.named_parameters()
-        if "edge_reconstructor" not in name
+        for parameter in model.parameters()
+        if id(parameter) not in reconstructor_parameter_ids
     ]
     main_optimizer = torch.optim.Adam(
         main_parameters, lr=config["stage2_learning_rate"]
@@ -314,12 +324,12 @@ def train_stage2(config, loaders, device, output_dir):
                 )
                 if edge_loss is None:
                     break
-                edge_loss.backward()
-                edge_optimizer.step()
                 if previous_classes is not None:
                     change_ratio = (classes != previous_classes).float().mean().item()
                     if change_ratio <= config["inner_tolerance"]:
                         break
+                edge_loss.backward()
+                edge_optimizer.step()
                 previous_classes = classes.detach()
 
             _set_stage2_trainable(model, reconstructors=False)

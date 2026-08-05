@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import inspect
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+
+_CHECKPOINT_SUPPORTS_REENTRANT = (
+    "use_reentrant" in inspect.signature(checkpoint).parameters
+)
 
 
 class WarpGate(nn.Module):
@@ -95,6 +102,14 @@ class _BidirectionalHierarchyInteraction(nn.Module):
 
     def forward(self, intra_states, inter_states, group_ids):
         if self.use_checkpoint and self.training and intra_states.requires_grad:
+            if _CHECKPOINT_SUPPORTS_REENTRANT:
+                return checkpoint(
+                    self._forward_impl,
+                    intra_states,
+                    inter_states,
+                    group_ids,
+                    use_reentrant=True,
+                )
             return checkpoint(self._forward_impl, intra_states, inter_states, group_ids)
         return self._forward_impl(intra_states, inter_states, group_ids)
 

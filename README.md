@@ -8,9 +8,13 @@ The public entry point implements the complete three-stage curriculum described
 in the paper:
 
 1. Stage 1 learns the affinity backbone from the static 4 Å atom-contact and
-   8 Å fragment–residue graphs using physical contact gates.
+   8 Å fragment–residue graphs. Bond, angle, and torsion surrogates jointly
+   gate every intramolecular GAT layer, while van der Waals, electrostatic,
+   and hydrogen-bond surrogates jointly gate intermolecular messages.
 2. Stage 2 expands atom candidates to 8 Å and alternately trains independent
    atom and substructure Remove/Keep/Add reconstructors and the affinity model.
+   Each physical contact is supervised once even though DGL represents it with
+   two oppositely directed message-passing edges.
 3. Stage 3 freezes both contact-scoring MLPs, recomputes their input-dependent
    soft weights on every forward pass, and fine-tunes the affinity network.
 
@@ -65,6 +69,10 @@ Run all three stages:
 python train.py
 ```
 
+The v2.1 intramolecular gates and 64-dimensional readout change checkpoint
+shapes relative to earlier releases. Retrain from Stage 1 rather than loading
+an older Stage-1/2/3 checkpoint.
+
 Or resume an individual stage after its predecessor's checkpoint exists:
 
 ```bash
@@ -74,8 +82,10 @@ python train.py --stage 3
 
 All paper-level architecture and optimization settings are centralized in
 `default.yaml`: batch size 16, 64-dimensional hidden states, two layers/steps,
-Stage 1/2/3 learning rates of `1e-4`, `5e-5`, and `1e-4`, and at most five
-Stage-2 inner iterations with a 0.01 topology-change tolerance.
+Stage 1/2/3 learning rates of `1e-4`, `5e-5`, and `1e-4`, 32-dimensional
+covalent and 64-dimensional non-covalent MLPs, and at most five Stage-2 inner
+iterations with early termination when the topology-change ratio is at or below
+0.01.
 
 The Refined cache is split deterministically into training and validation data,
 after excluding every complex present in the Core cache. Early stopping and
@@ -85,8 +95,10 @@ after the best Stage-3 checkpoint is restored, and the results are written to
 
 ## Verification
 
-The smoke tests construct a two-sample DGL batch and exercise Stage-1
-forward/backward propagation, both Stage-2 reconstructors, and Stage-3 freezing:
+The tests exercise exact atom-to-substructure mappings, 4/8 Å graph nesting,
+all three intramolecular gate channels, pair-level reconstruction, group-local
+cross-hierarchy broadcast, independent hierarchy/channel parameters, and
+Stage-3 reconstructor freezing with upstream gradient flow:
 
 ```bash
 python -m unittest discover -s tests -v

@@ -11,7 +11,7 @@ def featurize_atom(atom):
       - 原子序数
       - 形式电荷
       - 是否芳香（1 表示芳香，0 表示非芳香）
-      - 杂化类型（SP:0, SP2:1, SP3:2, SP3D:3, SP3D2:4，其它为 -1）
+      - 杂化类型（SP/未指定:0, SP2:1, SP3:2, SP3D:3, SP3D2:4）
       - Gasteiger 部分电荷（若未计算则为 0.0）
     返回: numpy 数组，dtype 为 float32。
     """
@@ -31,7 +31,9 @@ def featurize_atom(atom):
     elif hyb == Chem.rdchem.HybridizationType.SP3D2:
         hyb_val = 4
     else:
-        hyb_val = -1
+        # The paper uses a five-value code. Non-hybridized atoms (for example,
+        # explicit hydrogen) therefore share the zero code with SP atoms.
+        hyb_val = 0
 
     try:
         gasteiger = float(atom.GetProp("_GasteigerCharge"))

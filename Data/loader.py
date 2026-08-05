@@ -14,7 +14,6 @@ def load_complex_data(dataset_path):
         paths = {
             "pocket": complex_path / f"{compound_id}_pocket.pdb",
             "ligand": complex_path / f"{compound_id}_ligand.sdf",
-            "protein": complex_path / f"{compound_id}_protein.pdb",
         }
         missing = [str(path) for path in paths.values() if not path.exists()]
         if missing:

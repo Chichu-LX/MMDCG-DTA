@@ -10,7 +10,8 @@ from Data.graphs import (
     build_atom_interaction_graph,
     build_substructure_interaction_graph,
 )
-from Data.training import collate_samples
+from Data.hil import AtomLevelInteractiveLigand
+from Data.training import _combined_edge_loss, _set_stage2_trainable, collate_samples
 
 
 CONFIG = {
@@ -26,6 +27,10 @@ CONFIG = {
     "inter_negative_slope": 0.2,
     "hil_temperature": 1.0,
     "use_checkpoint": False,
+    "covalent_hidden_dim": 32,
+    "noncovalent_hidden_dim": 64,
+    "edge_reconstructor_hidden_dim": 64,
+    "readout_hidden_dim": 64,
 }
 
 
@@ -117,6 +122,31 @@ class ModelSmokeTest(unittest.TestCase):
         prediction = model(self.batch)
         self.assertEqual(tuple(prediction.shape), (2, 1))
         torch.nn.functional.mse_loss(prediction, self.batch["label"]).backward()
+        self.assertEqual(model.readout_gru.hidden_size, 64)
+        for hierarchy_gate in (
+            model.atom_intra_physics,
+            model.substructure_intra_physics,
+        ):
+            self.assertIsNotNone(hierarchy_gate.bond_simulator.mlp[0].weight.grad)
+            self.assertIsNotNone(
+                hierarchy_gate.angle_torsion_simulator.angle_mlp[0].weight.grad
+            )
+            self.assertIsNotNone(
+                hierarchy_gate.angle_torsion_simulator.torsion_mlp[0].weight.grad
+            )
+            self.assertIsNotNone(hierarchy_gate.channel_fusion.weight.grad)
+        for inter_encoder in (
+            model.inter_atom_encoder,
+            model.inter_substructure_encoder,
+        ):
+            self.assertIsNotNone(inter_encoder.mechanics.vdw_simulator[0].weight.grad)
+            self.assertIsNotNone(
+                inter_encoder.mechanics.electrostatic_simulator[0].weight.grad
+            )
+            self.assertIsNotNone(
+                inter_encoder.mechanics.hydrogen_bond_simulator[0].weight.grad
+            )
+            self.assertIsNotNone(inter_encoder.energy_fusion.weight.grad)
 
     def test_two_scale_reconstruction(self):
         model = MMDCGDTAModel_Stage2(CONFIG)
@@ -124,13 +154,107 @@ class ModelSmokeTest(unittest.TestCase):
         self.assertEqual(tuple(prediction.shape), (2, 1))
         self.assertEqual(
             auxiliary["atom"]["logits"].shape[0],
-            self.batch["atom_candidate_graph"].num_edges(),
+            self.batch["atom_candidate_graph"].num_edges() // 2,
         )
         self.assertEqual(
             auxiliary["substructure"]["logits"].shape[0],
-            self.batch["substructure_interaction_graph"].num_edges(),
+            self.batch["substructure_interaction_graph"].num_edges() // 2,
         )
+        self.assertEqual(
+            auxiliary["atom"]["stats"]["total"],
+            self.batch["atom_candidate_graph"].num_edges() // 2,
+        )
+        atom_parameter_ids = {
+            id(parameter) for parameter in model.atom_edge_reconstructor.parameters()
+        }
+        substructure_parameter_ids = {
+            id(parameter)
+            for parameter in model.substructure_edge_reconstructor.parameters()
+        }
+        self.assertTrue(atom_parameter_ids.isdisjoint(substructure_parameter_ids))
         prediction.sum().backward()
+
+    def test_stage1_checkpoint_has_only_reconstructor_keys_missing_in_stage2(self):
+        stage1 = MMDCGDTAModel_Stage1(CONFIG)
+        stage2 = MMDCGDTAModel_Stage2(CONFIG)
+        incompatible = stage2.load_state_dict(stage1.state_dict(), strict=False)
+        self.assertFalse(incompatible.unexpected_keys)
+        self.assertTrue(incompatible.missing_keys)
+        self.assertTrue(
+            all("edge_reconstructor" in key for key in incompatible.missing_keys)
+        )
+
+    def test_stage2_inner_and_outer_parameter_isolation(self):
+        model = MMDCGDTAModel_Stage2(CONFIG)
+        reconstructor_parameters = [
+            parameter
+            for reconstructor in model.reconstructors
+            for parameter in reconstructor.parameters()
+        ]
+        reconstructor_ids = {id(parameter) for parameter in reconstructor_parameters}
+        backbone_parameters = [
+            parameter
+            for parameter in model.parameters()
+            if id(parameter) not in reconstructor_ids
+        ]
+
+        _set_stage2_trainable(model, reconstructors=True)
+        _prediction, auxiliary = model(self.batch)
+        edge_loss, _classes = _combined_edge_loss(
+            auxiliary, self.batch, torch.nn.CrossEntropyLoss()
+        )
+        edge_loss.backward()
+        self.assertTrue(
+            any(parameter.grad is not None for parameter in reconstructor_parameters)
+        )
+        self.assertTrue(
+            all(parameter.grad is None for parameter in backbone_parameters)
+        )
+
+        model.zero_grad(set_to_none=True)
+        _set_stage2_trainable(model, reconstructors=False)
+        prediction, _auxiliary = model(self.batch)
+        torch.nn.functional.mse_loss(prediction, self.batch["label"]).backward()
+        self.assertTrue(
+            all(parameter.grad is None for parameter in reconstructor_parameters)
+        )
+        self.assertTrue(
+            any(parameter.grad is not None for parameter in backbone_parameters)
+        )
+
+    def test_cross_hierarchy_paths_do_not_share_parameters(self):
+        model = MMDCGDTAModel_Stage1(CONFIG)
+        modules = (
+            model.ligand_atom_interactive,
+            model.protein_atom_interactive,
+            model.ligand_substructure_interactive,
+            model.protein_substructure_interactive,
+        )
+        parameter_sets = [
+            {id(parameter) for parameter in module.parameters()} for module in modules
+        ]
+        for left in range(len(parameter_sets)):
+            for right in range(left + 1, len(parameter_sets)):
+                self.assertTrue(parameter_sets[left].isdisjoint(parameter_sets[right]))
+
+    def test_cross_hierarchy_broadcast_is_group_local(self):
+        torch.manual_seed(7)
+        module = AtomLevelInteractiveLigand(
+            num_steps=2,
+            dimension=8,
+            temperature=1.0,
+            negative_slope=0.2,
+            use_checkpoint=False,
+        )
+        intra = torch.randn(4, 8)
+        inter = torch.randn(4, 8)
+        groups = torch.tensor([0, 0, 1, 1])
+        reference = module(intra, inter, groups)
+        changed_intra = intra.clone()
+        changed_intra[:2] += 100.0
+        changed = module(changed_intra, inter, groups)
+        self.assertTrue(torch.allclose(reference[0][2:], changed[0][2:]))
+        self.assertTrue(torch.allclose(reference[1][2:], changed[1][2:]))
 
     def test_stage3_freezes_both_reconstructors(self):
         model = MMDCGDTAModel_Stage3(CONFIG)
@@ -138,6 +262,16 @@ class ModelSmokeTest(unittest.TestCase):
         self.assertTrue(
             all(
                 not parameter.requires_grad
+                for reconstructor in model.reconstructors
+                for parameter in reconstructor.parameters()
+            )
+        )
+        prediction, _auxiliary = model(self.batch)
+        prediction.sum().backward()
+        self.assertIsNotNone(model.ligand_atom_embedding.weight.grad)
+        self.assertTrue(
+            all(
+                parameter.grad is None
                 for reconstructor in model.reconstructors
                 for parameter in reconstructor.parameters()
             )

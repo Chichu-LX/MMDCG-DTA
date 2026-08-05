@@ -14,21 +14,34 @@ class MMDCGDTAModel_Stage2(MMDCGDTAModel_Stage1):
     def __init__(self, config):
         super().__init__(config)
         self.atom_edge_reconstructor = EdgeReconstructor(
-            self.d_atom_hidden, hidden_dim=64
+            self.d_atom_hidden,
+            hidden_dim=int(config.get("edge_reconstructor_hidden_dim", 64)),
         )
         self.substructure_edge_reconstructor = EdgeReconstructor(
-            self.d_sub_hidden, hidden_dim=64
+            self.d_sub_hidden,
+            hidden_dim=int(config.get("edge_reconstructor_hidden_dim", 64)),
         )
 
     @property
     def reconstructors(self):
         return (self.atom_edge_reconstructor, self.substructure_edge_reconstructor)
 
+    @staticmethod
+    def _pair_average(values, graph):
+        """Average the two directed DGL entries for each physical contact."""
+        if values.shape[0] != graph.num_edges() or graph.num_edges() % 2:
+            raise ValueError("contact graphs must contain two directions per pair")
+        pair_ids = graph.edata.get("pair_id")
+        if pair_ids is None or not torch.equal(pair_ids[0::2], pair_ids[1::2]):
+            raise ValueError("contact graph directions are not adjacent pair entries")
+        return 0.5 * (values[0::2] + values[1::2])
+
     def _reconstruct_contacts(self, hierarchy, graph, ligand_hidden, protein_hidden):
         if graph.num_edges() == 0:
             empty_logits = torch.empty(0, 3, device=ligand_hidden.device)
             return torch.empty(0, 1, device=ligand_hidden.device), {
                 "logits": empty_logits,
+                "probabilities": empty_logits,
                 "stats": {"total": 0, "remove": 0, "keep": 0, "add": 0},
             }
 
@@ -59,17 +72,29 @@ class MMDCGDTAModel_Stage2(MMDCGDTAModel_Stage1):
         protein_features = torch.where(
             (side[src] == 1).unsqueeze(-1), packed[src], packed[dst]
         )
-        logits = reconstructor(ligand_features, protein_features, graph.edata["dist"])
-        probabilities = F.softmax(logits, dim=-1)
-        weights = (probabilities[:, 1] + 2.0 * probabilities[:, 2]).unsqueeze(-1)
-        labels = logits.argmax(dim=-1)
+        directed_logits = reconstructor(
+            ligand_features, protein_features, graph.edata["dist"]
+        )
+        pair_logits = self._pair_average(directed_logits, graph)
+        pair_probabilities = self._pair_average(
+            F.softmax(directed_logits, dim=-1), graph
+        )
+        pair_weights = (
+            pair_probabilities[:, 1] + 2.0 * pair_probabilities[:, 2]
+        ).unsqueeze(-1)
+        weights = torch.repeat_interleave(pair_weights, 2, dim=0)
+        labels = pair_probabilities.argmax(dim=-1)
         stats = {
             "total": int(labels.numel()),
             "remove": int((labels == 0).sum().item()),
             "keep": int((labels == 1).sum().item()),
             "add": int((labels == 2).sum().item()),
         }
-        return weights, {"logits": logits, "stats": stats}
+        return weights, {
+            "logits": pair_logits,
+            "probabilities": pair_probabilities,
+            "stats": stats,
+        }
 
     def forward(self, sample):
         return self._forward_backbone(sample, dynamic_contacts=True)

@@ -1,42 +1,32 @@
+"""Neural molecular-mechanics surrogate channels used by MMDCG-DTA."""
+
+from __future__ import annotations
+
+import dgl
 import torch
 import torch.nn as nn
 
 
 class BondEnergyMLP(nn.Module):
-    """
-    模拟键伸长能 (Bond Stretching Energy)
-    输入: 边长 (距离)
-    输出: 能量标量
-    物理直觉: E = k * (r - r0)^2，MLP将拟合这个曲线
-    """
+    """Approximate a scalar stretching term from an edge distance."""
 
     def __init__(self, hidden_dim=32):
-        super(BondEnergyMLP, self).__init__()
+        super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(1, hidden_dim),
-            nn.SiLU(),  # SiLU (Swish) 平滑激活函数更适合拟合物理势能
-            nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 1),  # 输出能量标量
+            nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, dist):
-        # dist shape: [E, 1]
-        return self.mlp(dist)
+    def forward(self, distances):
+        return self.mlp(distances)
 
 
 class AngleDihedralEnergyMLP(nn.Module):
-    """
-    模拟键弯折能 (Angle Bending) 和 二面角势能 (Torsion)
-    由于原始图数据没有显式的角度/二面角索引，利用GNN聚合后的节点特征来近似。
-    节点特征经过图卷积后包含了邻居的几何信息。
-    输入: 节点特征
-    输出: 该节点相关的局部应变能
-    """
+    """Infer node-wise angular and torsional surrogate channels."""
 
-    def __init__(self, in_dim, hidden_dim=64):
-        super(AngleDihedralEnergyMLP, self).__init__()
-        # 分别模拟两个势能
+    def __init__(self, in_dim, hidden_dim=32):
+        super().__init__()
         self.angle_mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1)
         )
@@ -44,43 +34,99 @@ class AngleDihedralEnergyMLP(nn.Module):
             nn.Linear(in_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1)
         )
 
-    def forward(self, node_h):
-        E_angle = self.angle_mlp(node_h)
-        E_torsion = self.torsion_mlp(node_h)
-        return E_angle, E_torsion
+    def forward(self, node_states):
+        return self.angle_mlp(node_states), self.torsion_mlp(node_states)
+
+
+class IntraPhysicalGate(nn.Module):
+    """Joint bond/angle/torsion gate from Eq. (intra_physical_gate)."""
+
+    def __init__(self, state_dim, hidden_dim=32):
+        super().__init__()
+        self.bond_simulator = BondEnergyMLP(hidden_dim)
+        self.angle_torsion_simulator = AngleDihedralEnergyMLP(state_dim, hidden_dim)
+        self.channel_fusion = nn.Linear(3, 1)
+
+    @staticmethod
+    def _edge_distances(graph):
+        source, destination = graph.edges()
+        return torch.linalg.norm(
+            graph.ndata["pos"][source] - graph.ndata["pos"][destination],
+            dim=-1,
+            keepdim=True,
+        )
+
+    def terms(self, graph, node_states):
+        """Return edge gates and the node/edge surrogate terms for one layer."""
+        angle_nodes, torsion_nodes = self.angle_torsion_simulator(node_states)
+        if graph.num_edges() == 0:
+            empty = node_states.new_empty((0, 1))
+            return empty, {
+                "bond_edges": empty,
+                "angle_nodes": angle_nodes,
+                "torsion_nodes": torsion_nodes,
+                "angle_edges": empty,
+                "torsion_edges": empty,
+            }
+
+        source, destination = graph.edges()
+        bond_edges = self.bond_simulator(self._edge_distances(graph))
+        angle_edges = 0.5 * (angle_nodes[source] + angle_nodes[destination])
+        torsion_edges = 0.5 * (torsion_nodes[source] + torsion_nodes[destination])
+        channels = torch.cat((bond_edges, angle_edges, torsion_edges), dim=-1)
+        gates = torch.sigmoid(self.channel_fusion(channels))
+        return gates, {
+            "bond_edges": bond_edges,
+            "angle_nodes": angle_nodes,
+            "torsion_nodes": torsion_nodes,
+            "angle_edges": angle_edges,
+            "torsion_edges": torsion_edges,
+        }
+
+    def forward(self, graph, node_states):
+        gates, _terms = self.terms(graph, node_states)
+        return gates
+
+    def graph_summaries(self, graph, node_states):
+        """Return graph-level means used by the nine-channel affinity readout."""
+        _gates, terms = self.terms(graph, node_states)
+        batch_size = len(graph.batch_num_nodes())
+        if graph.num_edges() == 0:
+            bond = node_states.new_zeros((batch_size, 1))
+        else:
+            with graph.local_scope():
+                graph.edata["bond_surrogate"] = terms["bond_edges"]
+                bond = dgl.readout_edges(graph, "bond_surrogate", op="mean")
+        with graph.local_scope():
+            graph.ndata["angle_surrogate"] = terms["angle_nodes"]
+            graph.ndata["torsion_surrogate"] = terms["torsion_nodes"]
+            angle = dgl.readout_nodes(graph, "angle_surrogate", op="mean")
+            torsion = dgl.readout_nodes(graph, "torsion_surrogate", op="mean")
+        return bond, angle, torsion
 
 
 class InteractionForceMLP(nn.Module):
-    """
-    模拟非共价相互作用: 范德华力 (VDW), 静电 (Electrostatics), 氢键 (Hydrogen Bond)
-    输入: 配体节点特征, 蛋白节点特征, 距离
-    输出: 三种力的能量分量
-    """
+    """Approximate van der Waals, electrostatic, and hydrogen-bond channels."""
 
     def __init__(self, atom_dim, hidden_dim=64):
-        super(InteractionForceMLP, self).__init__()
-        self.input_dim = atom_dim * 2 + 1  # h_l + h_p + dist
+        super().__init__()
+        input_dim = atom_dim * 2 + 1
 
-        # 共享特征提取层
-        self.shared = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
+        def simulator():
+            return nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+
+        self.vdw_simulator = simulator()
+        self.electrostatic_simulator = simulator()
+        self.hydrogen_bond_simulator = simulator()
+
+    def forward(self, ligand_states, protein_states, distances):
+        inputs = torch.cat((ligand_states, protein_states, distances), dim=-1)
+        return (
+            self.vdw_simulator(inputs),
+            self.electrostatic_simulator(inputs),
+            self.hydrogen_bond_simulator(inputs),
         )
-
-        # 三个独立的头 (Heads)
-        self.vdw_head = nn.Linear(hidden_dim, 1)
-        self.elec_head = nn.Linear(hidden_dim, 1)
-        self.hbond_head = nn.Linear(hidden_dim, 1)
-
-    def forward(self, h_l, h_p, dist):
-        # 拼接特征
-        cat_feat = torch.cat([h_l, h_p, dist], dim=-1)
-        latent = self.shared(cat_feat)
-
-        E_vdw = self.vdw_head(latent)
-        E_elec = self.elec_head(latent)
-        E_hbond = self.hbond_head(latent)
-
-        return E_vdw, E_elec, E_hbond

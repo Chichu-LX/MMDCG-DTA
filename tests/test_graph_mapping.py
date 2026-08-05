@@ -49,6 +49,10 @@ class GraphMappingTest(unittest.TestCase):
         self.assertEqual(atoms.num_nodes(), 8)
         self.assertEqual(residues.num_nodes(), 2)
         self.assertEqual(set(groups.tolist()), {0, 1})
+        self.assertTrue(
+            ((atoms.ndata["h"][:, 3] >= 0) & (atoms.ndata["h"][:, 3] <= 4)).all()
+        )
+        self.assertTrue(atoms.ndata["h"][:, 4].abs().sum() > 0)
 
     def test_candidate_graph_contains_initial_contacts(self):
         ligand = build_ligand_atom_graph(self.sdf)
@@ -56,6 +60,10 @@ class GraphMappingTest(unittest.TestCase):
         initial = build_atom_interaction_graph(ligand, protein, 4.0)
         candidate = build_atom_interaction_graph(ligand, protein, 8.0)
         self.assertGreaterEqual(candidate.num_edges(), initial.num_edges())
+        self.assertEqual(candidate.num_edges() % 2, 0)
+        self.assertTrue(
+            (candidate.edata["pair_id"][0::2] == candidate.edata["pair_id"][1::2]).all()
+        )
 
 
 if __name__ == "__main__":
