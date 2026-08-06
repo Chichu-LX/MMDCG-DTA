@@ -39,6 +39,12 @@ may instead be installed from DGL's official wheel repository.
 
 ## Data preparation
 
+PDBbind can be obtained from the official
+[PDBbind+ portal](https://www.pdbbind-plus.org.cn/). The dataset is not bundled
+with this repository. A project-hosted OneDrive mirror will be linked here
+after the upload is complete and its redistribution complies with the PDBbind
+license and access terms.
+
 Place PDBbind data in this layout:
 
 ```text
