@@ -41,9 +41,9 @@ may instead be installed from DGL's official wheel repository.
 
 PDBbind can be obtained from the official
 [PDBbind+ portal](https://www.pdbbind-plus.org.cn/). The dataset is not bundled
-with this repository. A project-hosted OneDrive mirror will be linked here
-after the upload is complete and its redistribution complies with the PDBbind
-license and access terms.
+with this repository. Project data are available from the
+[MMDCG-DTA OneDrive data folder](https://onedrive.live.com/my?id=%2Fpersonal%2Fdde9bb07b5712251%2FDocuments%2FMMDCG%2DDTA&sortField=LinkFilename&isAscending=true&viewid=7768cdb2%2Dc0d4%2D4926%2Da43e%2D9f5a840826e5).
+Please ensure that all use complies with the PDBbind license and access terms.
 
 Place PDBbind data in this layout:
 
